@@ -5,6 +5,7 @@ The test server mimics the behaviour observed on real instances:
 * `POST /api/*` with the `{data, success, status}` envelope,
 * two login flavours (cookie `authToken` and `data.tokens.accessToken`),
 * `/pages/info` **without** content + `/pages/export` as raw text,
+* `/pages/export` and `/pages/delete` that reject a slugId and want the UUID,
 * `/search` that **requires** `query` and `spaceId`,
 * `/pages/sidebar-pages` that requires `spaceId`,
 * listings shaped as `{items, meta}`.
@@ -16,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -26,6 +28,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from docmost_mcp_oss.client import DocmostClient, DocmostError  # noqa: E402
 
+try:  # optional: needs the `yjs` extra
+    from docmost_mcp_oss import collab
+except ImportError:
+    collab = None
+
 API_KEY = "test-api-key"
 JWT = "test-jwt-token"
 EMAIL = "user@example.com"
@@ -33,9 +40,33 @@ PASSWORD = "secret"
 SPACE = "01a0c225-d97c-791f-98d0-296b43df9da7"
 PAGE = "01a0c23e-870b-7d54-99dd-cc4865174ba8"
 CHILD = "01a0c54b-0000-7000-8000-000000000001"
+CREATED = "01a0c600-0000-7000-8000-000000000002"
+IMPORTED = "01a0c600-0000-7000-8000-000000000003"
 
-# Login mode simulated by the server: "cookie" or "tokens".
+# Pages known to /pages/info, which accepts either identifier.
+PAGES = {
+    PAGE: {"id": PAGE, "slugId": "tRUr7isZOe", "title": "Conventions", "spaceId": SPACE},
+    CHILD: {"id": CHILD, "slugId": "chld01", "title": "Child", "spaceId": SPACE},
+    CREATED: {"id": CREATED, "slugId": "abc123", "title": "Created", "spaceId": SPACE},
+    IMPORTED: {"id": IMPORTED, "slugId": "imp123", "title": "Imported", "spaceId": SPACE},
+}
+UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+# Login mode simulated by the server: "cookie", "tokens" or "none".
 LOGIN_MODE = "cookie"
+
+# Every pageId sent to /pages/info, to assert slugIds are resolved once.
+INFO_CALLS: list[str] = []
+
+# Every pageId sent to /pages/export and /pages/delete.
+EXPORTED: list[str] = []
+DELETED: list[str] = []
+
+# When True, /pages/delete fails even with a UUID.
+FAIL_DELETE = False
+
+# Collab JWT issued by /auth/collab-token; None simulates a build without it.
+COLLAB_TOKEN: str | None = "test-collab-token"
 
 # Records every /pages/move call, so tests can assert on nesting.
 MOVED: list[dict] = []
@@ -90,6 +121,8 @@ class Handler(BaseHTTPRequestHandler):
                 )
             if LOGIN_MODE == "cookie":
                 return self._send(200, {"success": True, "status": 200}, {"authToken": JWT})
+            if LOGIN_MODE == "none":
+                return self._send(200, {"data": {}, "success": True, "status": 200})
             return self._send(
                 200,
                 {
@@ -101,6 +134,11 @@ class Handler(BaseHTTPRequestHandler):
 
         if not self._authed():
             return self._send(401, {"statusCode": 401, "message": "Unauthorized"})
+
+        if path == "/api/auth/collab-token" and COLLAB_TOKEN:
+            return self._send(
+                200, {"data": {"token": COLLAB_TOKEN}, "success": True, "status": 200}
+            )
 
         if path == "/api/users/me":
             return self._send(
@@ -143,21 +181,23 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/pages/info":
             # Metadata WITHOUT content, just like on real builds.
-            return self._send(
-                200,
-                {
-                    "data": {
-                        "id": PAGE,
-                        "slugId": "tRUr7isZOe",
-                        "title": "Conventions",
-                        "spaceId": SPACE,
-                    },
-                    "success": True,
-                    "status": 200,
-                },
+            INFO_CALLS.append(body.get("pageId"))
+            wanted = body.get("pageId")
+            page = next(
+                (p for p in PAGES.values() if wanted in (p["id"], p["slugId"])),
+                None,
             )
+            if page is None:
+                return self._send(404, {"statusCode": 404, "message": "Page not found"})
+            return self._send(200, {"data": page, "success": True, "status": 200})
 
         if path == "/api/pages/export":
+            # Same as the build this was reported against: a slugId is rejected.
+            EXPORTED.append(body.get("pageId"))
+            if not UUID_RE.match(body.get("pageId") or ""):
+                return self._send(
+                    400, {"statusCode": 400, "message": "No accessible pages to export"}
+                )
             if body.get("format") not in ("markdown", "html"):
                 return self._send(
                     400,
@@ -252,6 +292,13 @@ class Handler(BaseHTTPRequestHandler):
             )
             return self._send(200, {"data": {}, "success": True, "status": 200})
 
+        if path == "/api/pages/delete":
+            # A slugId makes this build fail with a bare 500.
+            DELETED.append(body.get("pageId"))
+            if FAIL_DELETE or not UUID_RE.match(body.get("pageId") or ""):
+                return self._send(500, {"statusCode": 500, "message": "Internal server error"})
+            return self._send(200, {"success": True, "status": 200})
+
         if path == "/api/pages/breadcrumbs":
             # Raw list, not {items}.
             return self._send(
@@ -265,7 +312,7 @@ class Handler(BaseHTTPRequestHandler):
                 200,
                 {
                     "data": {
-                        "id": "nuevo-1",
+                        "id": CREATED,
                         "slugId": "abc123",
                         "title": body.get("title"),
                     },
@@ -290,7 +337,7 @@ class Handler(BaseHTTPRequestHandler):
                 200,
                 {
                     "data": {
-                        "id": "imp-1",
+                        "id": IMPORTED,
                         "slugId": "imp123",
                         "title": title,
                         "position": "a0003",
@@ -321,7 +368,7 @@ def start_server() -> tuple[HTTPServer, str]:
 
 
 async def run_tests(base_url: str) -> None:
-    global LOGIN_MODE
+    global LOGIN_MODE, FAIL_DELETE, COLLAB_TOKEN
 
     # --- 1. Cookie login + `data` unwrapping ---
     LOGIN_MODE = "cookie"
@@ -330,15 +377,45 @@ async def run_tests(base_url: str) -> None:
         assert (await dm.list_spaces())[0]["id"] == SPACE
         print("✓ cookie login + `{items, meta}` listings + `data` unwrapping")
 
+        # --- 1b. the cookie token is kept as the bearer (the collab WebSocket needs it) ---
+        assert dm._bearer == JWT, dm._bearer
+        dm._client.cookies.clear()
+        assert await dm.list_spaces(), "the cookie token should work as Bearer on its own"
+        print("✓ cookie-only login stores the `authToken` cookie as the bearer")
+
+        # --- 1c. the collab WebSocket gets its own token, or the bearer on older builds ---
+        assert await dm.get_collab_token() == "test-collab-token"
+        COLLAB_TOKEN = None
+        try:
+            assert await dm.get_collab_token() == JWT
+        finally:
+            COLLAB_TOKEN = "test-collab-token"
+        print("✓ get_collab_token prefers /auth/collab-token and falls back to the bearer")
+
     # --- 2. Login with tokens in the body (this build) ---
     LOGIN_MODE = "tokens"
     async with DocmostClient(base_url, email=EMAIL, password=PASSWORD) as dm:
         assert await dm.list_spaces(), "should authenticate with accessToken as Bearer"
+        assert dm._bearer == JWT and dm._refresh_token == "r", dm._bearer
         print("✓ login with `data.tokens.accessToken` re-sent as Bearer")
+
+    # --- 2b. Login with neither the cookie nor tokens fails loudly ---
+    LOGIN_MODE = "none"
+    nothing = DocmostClient(base_url, email=EMAIL, password=PASSWORD)
+    try:
+        await nothing.authenticate()
+        raise AssertionError("should reject a login with no token")
+    except DocmostError as exc:
+        assert "neither" in exc.message, exc
+        assert nothing._bearer is None
+    finally:
+        await nothing.aclose()
+    print("✓ login without a cookie or tokens raises instead of leaving the bearer empty")
 
     # --- 3. API Key as Bearer ---
     async with DocmostClient(base_url, api_key=API_KEY) as dm:
-        assert (await dm.create_page(SPACE, title="X"))["id"] == "nuevo-1"
+        assert dm._bearer == API_KEY
+        assert (await dm.create_page(SPACE, title="X"))["id"] == CREATED
         print("✓ API Key authentication (Bearer)")
 
     async with DocmostClient(base_url, api_key=API_KEY) as dm:
@@ -425,7 +502,7 @@ async def run_tests(base_url: str) -> None:
         assert page["slugId"] == "imp123", page
         # `/pages/import` ignores parentPageId, so the client must nest it after.
         assert len(MOVED) == before + 1, f"/pages/move was not called: {MOVED}"
-        assert MOVED[-1]["pageId"] == "imp123", MOVED
+        assert MOVED[-1]["pageId"] == IMPORTED, MOVED
         assert MOVED[-1]["parentPageId"] == PAGE, MOVED
         assert MOVED[-1]["position"] == "a0003", MOVED  # keeps its own position
         assert page["parentPageId"] == PAGE, page
@@ -450,6 +527,78 @@ async def run_tests(base_url: str) -> None:
         await dm.create_page(SPACE, title="Root only", parent_page_id=PAGE)
         assert MOVED == [], f"unexpected /pages/move call: {MOVED}"
         print("✓ create_page without content does not need a move")
+
+    # --- 8g. slugIds are resolved to the UUID before reaching strict endpoints ---
+    async with DocmostClient(base_url, api_key=API_KEY) as dm:
+        INFO_CALLS.clear()
+        assert await dm.resolve_page_id(PAGE) == PAGE
+        assert INFO_CALLS == [], f"a UUID should not need a lookup: {INFO_CALLS}"
+
+        assert await dm.resolve_page_id("tRUr7isZOe") == PAGE
+        assert await dm.resolve_page_id("tRUr7isZOe") == PAGE
+        assert INFO_CALLS == ["tRUr7isZOe"], f"slugId should be looked up once: {INFO_CALLS}"
+
+        try:
+            await dm.resolve_page_id("missing1")
+            raise AssertionError("an unknown slugId should fail")
+        except DocmostError as exc:
+            assert exc.status == 404, exc
+
+        EXPORTED.clear()
+        exported = await dm.export_page("tRUr7isZOe")
+        assert exported["content"].startswith("# Conventions"), exported
+        page = await dm.get_page("tRUr7isZOe")
+        assert page["content"].startswith("# Conventions"), page
+        assert EXPORTED == [PAGE, PAGE], EXPORTED
+
+        DELETED.clear()
+        await dm.delete_page("imp123")
+        assert DELETED == [IMPORTED], DELETED
+
+        MOVED.clear()
+        await dm.move_page("chld01", "a0005", parent_page_id="tRUr7isZOe")
+        assert MOVED == [{"pageId": CHILD, "parentPageId": PAGE, "position": "a0005"}], MOVED
+        print("✓ slugIds are resolved to UUIDs (once) for export, delete and move")
+
+    # --- 8h. a failed cleanup delete does not mask the conversion error ---
+    if collab is None:
+        print("- skipped cleanup test: the `yjs` extra is not installed")
+    else:
+
+        async def refuse(self, page_id):
+            raise collab.CollabError("websocket refused")
+
+        class Collect(logging.Handler):
+            def __init__(self):
+                super().__init__()
+                self.records: list[logging.LogRecord] = []
+
+            def emit(self, record):
+                self.records.append(record)
+
+        logger = logging.getLogger("docmost_mcp_oss.collab")
+        collected = Collect()
+        logger.addHandler(collected)
+        logger.propagate = False
+
+        original_open = collab.CollabClient.open
+        collab.CollabClient.open = refuse
+        FAIL_DELETE = True
+        DELETED.clear()
+        try:
+            async with DocmostClient(base_url, api_key=API_KEY) as dm:
+                await collab.blocks_from_markdown(dm, SPACE, "Some text.")
+            raise AssertionError("the conversion error should propagate")
+        except collab.CollabError as exc:
+            assert "websocket refused" in str(exc), exc
+        finally:
+            collab.CollabClient.open = original_open
+            FAIL_DELETE = False
+            logger.removeHandler(collected)
+            logger.propagate = True
+        assert DELETED == [IMPORTED], f"cleanup should target the UUID: {DELETED}"
+        assert any(IMPORTED in r.getMessage() for r in collected.records), collected.records
+        print("✓ blocks_from_markdown re-raises the real error when cleanup fails")
 
     # --- 9. Translated errors ---
     bad = DocmostClient(base_url, email=EMAIL, password="malo")

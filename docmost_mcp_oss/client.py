@@ -17,11 +17,15 @@ Details verified against real instances (see `docs/DOCMOST-API.md`):
 * `/search` requires `query` **and** `spaceId`; without `spaceId`, a fan-out
   per space is performed from here.
 * `sidebar-pages` always requires `spaceId` (and optionally `pageId`).
+* Some builds accept a `slugId` on `/pages/info` but reject it on
+  `/pages/export` (400) and `/pages/delete` (500), so page identifiers are
+  resolved to the UUID before being sent anywhere else.
 """
 
 from __future__ import annotations
 
 import os
+import re
 from typing import Any
 
 import httpx
@@ -80,6 +84,8 @@ class DocmostClient:
         self._bearer: str | None = self._api_key
         self._refresh_token: str | None = None
         self._authenticated = bool(self._api_key)
+        # slugId -> UUID, filled by `resolve_page_id`.
+        self._page_ids: dict[str, str] = {}
         # The cookie jar persists the `authToken` cookie in builds that use it.
         self._client = httpx.AsyncClient(
             base_url=self.base_url,
@@ -143,16 +149,20 @@ class DocmostClient:
                 payload,
             )
 
-        # Form 1 — `authToken` cookie (builds that issue it).
-        if self._client.cookies.get("authToken"):
-            self._authenticated = True
-            return
-
-        # Form 2 — tokens in the body: data.tokens.accessToken.
+        # Form 1 — tokens in the body: data.tokens.accessToken.
         tokens = data.get("tokens") if isinstance(data, dict) else None
         if isinstance(tokens, dict) and tokens.get("accessToken"):
             self._bearer = tokens["accessToken"]
             self._refresh_token = tokens.get("refreshToken")
+            self._authenticated = True
+            return
+
+        # Form 2 — only the httpOnly `authToken` cookie (builds that issue it).
+        # REST calls would work through the cookie jar alone, but the collab
+        # WebSocket needs the token explicitly, so keep it as the bearer too.
+        cookie_token = self._client.cookies.get("authToken")
+        if cookie_token:
+            self._bearer = cookie_token
             self._authenticated = True
             return
 
@@ -162,6 +172,23 @@ class DocmostClient:
             "'data.tokens.accessToken'. Unexpected response shape.",
             payload,
         )
+
+    async def get_collab_token(self) -> str:
+        """Token for the `/collab` WebSocket.
+
+        Current builds only accept a dedicated collab JWT there, issued by
+        `POST /auth/collab-token`; the login token is rejected. Older builds
+        without that endpoint accepted the login token, so it is the fallback.
+        """
+        try:
+            data = await self.request("/auth/collab-token")
+        except DocmostError:
+            data = None
+        token = data.get("token") if isinstance(data, dict) else None
+        token = token or self._bearer
+        if not token:
+            raise DocmostError(None, "No token available for the collaboration server")
+        return token
 
     # ------------------------------------------------------------------ #
     # HTTP core
@@ -290,6 +317,25 @@ class DocmostClient:
     # ------------------------------------------------------------------ #
     # Pages
     # ------------------------------------------------------------------ #
+    async def resolve_page_id(self, page_id: str) -> str:
+        """Returns the UUID of a page identified by its UUID or its slugId.
+
+        Some builds reject a slugId on `/pages/export` (400 "No accessible pages
+        to export") and `/pages/delete` (500), so every endpoint other than
+        `/pages/info` is sent the UUID. A UUID is returned as-is without a
+        request; a slugId is looked up once via `/pages/info` and cached.
+        """
+        if _is_uuid(page_id):
+            return page_id
+        if page_id in self._page_ids:
+            return self._page_ids[page_id]
+        page = await self.request("/pages/info", {"pageId": page_id})
+        uuid = page.get("id") if isinstance(page, dict) else None
+        if not uuid:
+            raise DocmostError(None, f"Could not resolve page {page_id!r} to its UUID")
+        self._page_ids[page_id] = uuid
+        return uuid
+
     async def get_page(
         self,
         page_id: str,
@@ -310,7 +356,7 @@ class DocmostClient:
             return {"page": page}
 
         try:
-            export = await self.export_page(page_id, format=format)
+            export = await self.export_page(page.get("id") or page_id, format=format)
         except DocmostError as exc:
             return {**page, "content": None, "content_error": str(exc)}
         return {**page, "content": export["content"], "content_format": format}
@@ -322,6 +368,7 @@ class DocmostClient:
         """
         if format not in EXPORT_FORMATS:
             raise ValueError(f"format must be one of {EXPORT_FORMATS}")
+        page_id = await self.resolve_page_id(page_id)
         await self.authenticate()
         resp = await self._client.post(
             f"{API_PREFIX}/pages/export",
@@ -370,8 +417,10 @@ class DocmostClient:
         page = await self.import_page(
             space_id, content, title=title, format=format, parent_page_id=parent_page_id
         )
-        if icon is not None and page.get("slugId"):
-            await self.request("/pages/update", {"pageId": page["slugId"], "icon": icon})
+        page_ref = page.get("id") or page.get("slugId")
+        if icon is not None and page_ref:
+            page_ref = await self.resolve_page_id(page_ref)
+            await self.request("/pages/update", {"pageId": page_ref, "icon": icon})
         return page
 
     async def import_page(
@@ -417,7 +466,7 @@ class DocmostClient:
         # endpoint that actually sets the parent. The page keeps the position it
         # was given at creation so it does not jump around.
         if parent_page_id and page:
-            page_id = page.get("slugId") or page.get("id")
+            page_id = page.get("id") or page.get("slugId")
             if page_id:
                 await self.move_page(
                     page_id,
@@ -452,16 +501,21 @@ class DocmostClient:
                 "create a new page with the content (`create_page`, which "
                 "uses `/pages/import`), or edit the body in the web UI.",
             )
-        body: dict[str, Any] = {"pageId": page_id}
+        body: dict[str, Any] = {"pageId": await self.resolve_page_id(page_id)}
         if title is not None:
             body["title"] = title
         return await self.request("/pages/update", body)
 
     async def delete_page(self, page_id: str) -> Any:
         """Moves the page to the trash (this build does not expose permanent deletion)."""
+        page_id = await self.resolve_page_id(page_id)
         return await self.request("/pages/delete", {"pageId": page_id})
 
     async def restore_page(self, page_id: str) -> Any:
+        try:
+            page_id = await self.resolve_page_id(page_id)
+        except DocmostError:
+            pass  # a trashed page may not resolve; send the identifier as given
         return await self.request("/pages/restore", {"pageId": page_id})
 
     async def move_page(
@@ -487,6 +541,9 @@ class DocmostClient:
         ``position`` is the manual escape hatch: passing it skips all of the
         above and sends the value as-is.
         """
+        page_id = await self.resolve_page_id(page_id)
+        if parent_page_id is not None:
+            parent_page_id = await self.resolve_page_id(parent_page_id)
         if position is None:
             position = await self._position_for(
                 page_id, parent_page_id=parent_page_id, after=after, before=before
@@ -589,6 +646,8 @@ class DocmostClient:
             space_id = (page or {}).get("spaceId") if isinstance(page, dict) else None
         if not space_id:
             raise ValueError("Provide space_id (or page_id)")
+        if page_id:
+            page_id = await self.resolve_page_id(page_id)
 
         body: dict[str, Any] = {"spaceId": space_id, "limit": _clamp_limit(limit)}
         if page_id:
@@ -658,15 +717,18 @@ class DocmostClient:
         return found
 
     async def get_page_breadcrumbs(self, page_id: str) -> list[dict]:
+        page_id = await self.resolve_page_id(page_id)
         return _items(await self.request("/pages/breadcrumbs", {"pageId": page_id}))
 
     async def get_page_history(self, page_id: str) -> list[dict]:
+        page_id = await self.resolve_page_id(page_id)
         return _items(await self.request("/pages/history", {"pageId": page_id}))
 
     # ------------------------------------------------------------------ #
     # Comments
     # ------------------------------------------------------------------ #
     async def get_comments(self, page_id: str, *, limit: int = 50) -> list[dict]:
+        page_id = await self.resolve_page_id(page_id)
         return _items(
             await self.request("/comments", {"pageId": page_id, "limit": _clamp_limit(limit)})
         )
@@ -681,7 +743,7 @@ class DocmostClient:
     ) -> Any:
         """`content` must be a **valid JSON string** (Tiptap/ProseMirror document)."""
         body: dict[str, Any] = {
-            "pageId": page_id,
+            "pageId": await self.resolve_page_id(page_id),
             "content": content,
             "type": comment_type,
         }
@@ -701,6 +763,16 @@ class DocmostClient:
 # ---------------------------------------------------------------------- #
 #: Docmost rejects `limit > 100` on its list endpoints.
 MAX_LIMIT = 100
+
+
+_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE
+)
+
+
+def _is_uuid(value: str) -> bool:
+    """Page UUIDs are canonical 8-4-4-4-12 hex; anything else is a slugId."""
+    return bool(_UUID_RE.match(value or ""))
 
 
 def _clamp_limit(limit: int, *, maximum: int = MAX_LIMIT) -> int:

@@ -10,8 +10,9 @@ instance):
 
 * URL: ``wss://<host>/collab``
 * Document name: ``page.<pageId>``
-* **Auth**: the token is the same ``accessToken`` returned by
-  ``POST /api/auth/login``. The message is::
+* **Auth**: current builds want the collab JWT from
+  ``POST /api/auth/collab-token``; older ones took the ``accessToken`` returned
+  by ``POST /api/auth/login``. The message is::
 
       varString(documentName) + varUint(2=Auth) + varUint(0=Token) + varString(token)
 
@@ -35,6 +36,7 @@ over ranges of the ``XmlText``, e.g. ``xmltext.insert(0, "hello", {"bold": True}
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -45,6 +47,8 @@ except ImportError as exc:  # pragma: no cover
     raise ImportError(
         "Yjs support requires the extras: pip install 'docmost-mcp-oss[yjs]'"
     ) from exc
+
+log = logging.getLogger(__name__)
 
 AUTH = 2
 SYNC = 0
@@ -159,6 +163,8 @@ class CollabClient:
     # -- connection ----------------------------------------------------- #
     async def open(self, page_id: str) -> None:
         """Authenticates and syncs the page's document."""
+        if not self.token:
+            raise CollabError("No token for the collaboration server; authenticate first")
         self._document = f"page.{page_id}"
         self._doc = Doc()
         self._ws = await ws_connect(
@@ -347,16 +353,21 @@ async def blocks_from_markdown(client: Any, space_id: str, markdown: str) -> lis
         headers=client._headers(),
     )
     page = (response.json() or {}).get("data") or {}
-    page_id = page.get("slugId") or page.get("id")
+    page_id = page.get("id") or page.get("slugId")
     if not page_id:
         raise CollabError("Could not create the temporary conversion page")
 
     try:
-        async with CollabClient(client.base_url, client._bearer) as collab:
+        page_id = await client.resolve_page_id(page_id)
+        async with CollabClient(client.base_url, await client.get_collab_token()) as collab:
             await collab.open(page_id)
             return await collab.read_blocks()
     finally:
-        await client.delete_page(page_id)
+        # A failed cleanup must not replace whatever the conversion raised.
+        try:
+            await client.delete_page(page_id)
+        except Exception:
+            log.warning("Could not delete the temporary conversion page %s", page_id, exc_info=True)
 
 
 async def update_page_content(
@@ -378,8 +389,9 @@ async def update_page_content(
         raise CollabError(f"Could not resolve the space for page {page_id}")
 
     blocks = await blocks_from_markdown(client, space_id, markdown)
-    async with CollabClient(client.base_url, client._bearer) as collab:
-        await collab.open(page_id)
+    # The web editor opens `page.<uuid>`; a slugId would name another document.
+    async with CollabClient(client.base_url, await client.get_collab_token()) as collab:
+        await collab.open(page.get("id") or page_id)
         sent = await collab.replace_blocks(blocks, mode=mode)
         await collab.wait_for_persistence()
 

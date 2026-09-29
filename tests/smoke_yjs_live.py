@@ -84,8 +84,8 @@ async def main(keep: bool) -> int:
         print(f"     | {line}")
 
     # 3) replace the body of the EXISTING page
-    async with CollabClient(client.base_url, client._bearer) as collab:
-        await collab.open(page_id)
+    async with CollabClient(client.base_url, await client.get_collab_token()) as collab:
+        await collab.open(await client.resolve_page_id(page_id))
         actuales = await collab.read_blocks()
         print(f"\n3) document opened: {len(actuales)} current block(s)")
         sent = await collab.replace_blocks(blocks)
